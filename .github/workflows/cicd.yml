@@ -1,0 +1,128 @@
+name: CI/CD - Node App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+concurrency:
+  group: node-app-deploy
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test & Upload Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+
+      - name: Run tests and save results
+        run: |
+          set +e
+          npm test 2>&1 | tee test-results.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+        id: test_run
+
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+
+      - name: Fail if tests failed
+        if: steps.test_run.outputs.exit_code != '0'
+        run: |
+          echo "Tests failed. See artifact test-results."
+          exit 1
+
+  deploy:
+    name: Deploy on Self-Hosted
+
+    needs: test
+
+    runs-on: [ self-hosted, linux, node-app ]
+    environment:
+      name: production
+      url: http://localhost:3000
+    steps:
+      - name: Download test results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: ./artifact
+
+      - name: Display test artifact
+        run: |
+          echo "=== TEST RESULTS (artifact/test-results.txt) ==="
+          cat artifact/test-results.txt || true
+          echo "=== END TEST RESULTS ==="
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install prod dependencies
+        run: npm ci --omit=dev
+
+
+      - name: Build
+        run: |
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build
+          else
+            echo "No build script; skipping."
+          fi
+
+
+      - name: Ensure PM2 is installed
+        run: |
+          if ! command -v pm2 >/dev/null 2>&1; then
+            npm -g install pm2
+          fi
+
+      - name: Start/Reload app with PM2
+        run: |
+          mkdir -p scripts
+          if [ ! -f scripts/ecosystem.config.js ]; then
+            cat > scripts/ecosystem.config.js <<'EOF'
+module.exports = {
+  apps: [{
+    name: "node-app",
+    script: "npm",
+    args: "start",
+    env: {
+      NODE_ENV: "production",
+      PORT: 3000
+    }
+  }]
+}
+EOF
+          fi
+          pm2 startOrReload scripts/ecosystem.config.js
+          pm2 save
+
+      - name: Show running processes
+        run: pm2 ls
